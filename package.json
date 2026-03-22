@@ -1,11 +1,24 @@
 {
   "name": "pi-agentic-compaction",
   "version": "0.3.0",
-  "description": "Pi extension for intelligent conversation compaction using a virtual filesystem and LLM exploration",
+  "description": "Pi extension for agentic conversation compaction using a virtual filesystem and tool-driven exploration",
   "type": "module",
-  "keywords": ["pi-package"],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": ["pi-package", "pi", "compaction", "llm", "agent"],
   "license": "MIT",
   "author": "laulauland",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laulauland/pi-agentic-compaction.git"
+  },
+  "homepage": "https://github.com/laulauland/pi-agentic-compaction#readme",
+  "bugs": {
+    "url": "https://github.com/laulauland/pi-agentic-compaction/issues"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   },
