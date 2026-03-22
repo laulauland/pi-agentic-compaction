@@ -41,7 +41,7 @@ The extension also adds some deterministic guardrails:
 
 The agentic compaction loop is a good fit for small, fast models. The task is structured: navigate a JSON file, run a few shell commands, and emit a summary in a defined format. That plays to the strengths of instruction-following models like `gpt-5.4-mini` — models that are reliable on well-specified tasks, respond quickly, and are cheap enough that multiple tool-call steps do not become a bottleneck.
 
-By default it tries these models, in order:
+By default the extension tries these models, in order:
 
 ```ts
 const COMPACTION_MODELS = [
@@ -51,6 +51,59 @@ const COMPACTION_MODELS = [
 ```
 
 If none are available, it falls back to the current session model.
+
+You can override that interactively with:
+
+```text
+/compaction-model
+```
+
+That command opens a picker where you can:
+
+- choose multiple compaction models
+- reorder them into fallback order
+- switch between `scoped` models (from pi's `enabledModels`) and `all` available models
+- persist the selection to pi settings
+
+Picker controls:
+
+- type to filter
+- `Enter` toggles the highlighted model
+- `Alt+↑/↓` reorders a selected model
+- `Tab` switches between `all` and `scoped`
+- `Ctrl+A` selects all visible models
+- `Ctrl+X` clears visible selections
+- `Ctrl+S` saves
+- `Esc` cancels
+
+You can also choose the save target explicitly:
+
+```text
+/compaction-model global
+/compaction-model project
+```
+
+The effective config is stored under a namespaced block in pi settings:
+
+```json
+{
+  "pi-agentic-compaction": {
+    "models": [
+      "cerebras/zai-glm-4.7",
+      "openai/gpt-5.4-mini"
+    ]
+  }
+}
+```
+
+Locations follow normal pi settings precedence:
+
+- global: `~/.pi/agent/settings.json`
+- project: `.pi/settings.json`
+
+Project settings override global settings.
+
+At runtime, the extension tries the persisted models in order and skips any that are unavailable, unauthenticated, or no longer registered. If none work, it falls back to the session model.
 
 ### Steerable compaction
 
@@ -94,9 +147,7 @@ Then reload pi:
 
 ## Usage
 
-You generally do not invoke the extension directly.
-
-It runs whenever pi compacts context:
+The extension runs whenever pi compacts context:
 
 - automatically when pi approaches the context limit
 - manually when you run `/compact`
@@ -107,18 +158,46 @@ You can provide extra guidance to the summarizer:
 /compact focus on the authentication changes and unresolved bugs
 ```
 
+To configure the ordered fallback models used for compaction:
+
+```text
+/compaction-model
+```
+
+Note: the picker is a TUI command, so it is only available in interactive pi sessions.
+
 ## Configuration
 
-Configuration currently lives in `index.ts` near the top of the file.
+There are two layers of configuration:
 
-Useful constants include:
+### 1. Interactive model selection (recommended)
+
+Use `/compaction-model` and persist the selected ordered fallback list into pi settings under:
+
+```json
+{
+  "pi-agentic-compaction": {
+    "models": ["cerebras/zai-glm-4.7", "openai/gpt-5.4-mini"]
+  }
+}
+```
+
+### 2. Code-level defaults
+
+If no persisted model list exists, the extension falls back to the defaults in `index.ts`:
 
 ```ts
 const COMPACTION_MODELS = [
   { provider: "cerebras", id: "zai-glm-4.7" },
   { provider: "openai", id: "gpt-5.4-mini" },
 ];
+```
 
+When writing settings, the extension updates only the `pi-agentic-compaction.models` field and preserves the rest of the settings file.
+
+Other implementation-level constants still live in `index.ts`, for example:
+
+```ts
 const DEBUG_COMPACTIONS = false;
 const TOOL_RESULT_MAX_CHARS = 50000;
 const TOOL_CALL_CONCURRENCY = 6;
@@ -160,7 +239,12 @@ The agentic loop structure partially compensates for the limitations of smaller 
 
 That said, small models can struggle when sessions involve nuanced reasoning, implicit dependencies, or ambiguous cause-and-effect chains. If the exploration strategy in the prompt does not surface the right parts of the transcript, a smaller model is less likely to recover from that.
 
-If summary quality on complex sessions matters more than speed or cost, consider updating `COMPACTION_MODELS` in `index.ts` to use a larger model. The rest of the extension is model-agnostic.
+If summary quality on complex sessions matters more than speed or cost, either:
+
+- use `/compaction-model` to pick larger models interactively, or
+- update `COMPACTION_MODELS` in `index.ts` to change the default fallback list
+
+The rest of the extension is model-agnostic.
 
 ## Package contents
 

@@ -7,23 +7,28 @@
  */
 
 import { complete, type Message, type AssistantMessage, type ToolResultMessage, type Tool, type Model } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { convertToLlm } from "@mariozechner/pi-coding-agent";
+import { convertToLlm, DynamicBorder, getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Container, type Focusable, fuzzyFilter, getKeybindings, Input, Key, matchesKey, Spacer, Text, type TUI } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { Bash } from "just-bash";
-import * as fs from "fs";
-import * as path from "path";
-import { homedir } from "os";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { homedir } from "node:os";
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-// Models to try for compaction, in order of preference
+// Default models to try for compaction, in order of preference.
+// These are used when the user has not persisted an explicit model list yet.
 const COMPACTION_MODELS = [
     { provider: "cerebras", id: "zai-glm-4.7" },
-    { provider: "anthropic", id: "claude-haiku-4-5" },
+    { provider: "openai", id: "gpt-5.4-mini" },
 ];
+
+const CONFIG_NAMESPACE = "pi-agentic-compaction";
+const PROJECT_CONFIG_DIR = ".pi";
+const THINKING_LEVEL_SUFFIXES = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 // Debug mode - saves compaction data to ~/.pi/agent/compactions/
 const DEBUG_COMPACTIONS = false;
@@ -33,6 +38,52 @@ const TOOL_RESULT_MAX_CHARS = 50000;
 const TOOL_CALL_PREVIEW_CHARS = 60;
 const TOOL_CALL_CONCURRENCY = 6;
 const MIN_SUMMARY_CHARS = 100;
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+type JsonObject = Record<string, unknown>;
+type RequestAuth = { apiKey?: string; headers?: Record<string, string> };
+type ConfigScope = "global" | "project";
+type ConfigSource = "default" | ConfigScope;
+type PickerScope = "all" | "scoped";
+
+type PersistedCompactionConfig = {
+    models?: string[];
+};
+
+type ReadJsonResult = {
+    exists: boolean;
+    data: JsonObject;
+    error?: string;
+};
+
+type LoadedCompactionConfig = {
+    models: string[];
+    source: ConfigSource;
+    globalRead: ReadJsonResult;
+    projectRead: ReadJsonResult;
+    paths: {
+        global: string;
+        project: string;
+    };
+};
+
+type DetectedFileOps = {
+    modifiedFiles: string[];
+    deletedFiles: string[];
+};
+
+type PickerResult = {
+    modelIds: string[];
+};
+
+type PickerItem = {
+    fullId: string;
+    model: Model<any>;
+    selected: boolean;
+};
 
 // ============================================================================
 // UTILITIES
@@ -49,6 +100,40 @@ function extractTextFromContent(content: any): string {
         .map((block) => block.text)
         .join("\n")
         .trim();
+}
+
+function fullModelId(model: Pick<Model<any>, "provider" | "id">): string {
+    return `${model.provider}/${model.id}`;
+}
+
+function getDefaultCompactionModelIds(): string[] {
+    return COMPACTION_MODELS.map((model) => `${model.provider}/${model.id}`);
+}
+
+function parseFullModelId(value: string): { provider: string; id: string } | null {
+    const trimmed = value.trim();
+    const slashIndex = trimmed.indexOf("/");
+    if (slashIndex <= 0 || slashIndex === trimmed.length - 1) return null;
+    return {
+        provider: trimmed.slice(0, slashIndex),
+        id: trimmed.slice(slashIndex + 1),
+    };
+}
+
+function normalizeModelIds(values: string[]): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+
+    for (const value of values) {
+        const trimmed = value.trim();
+        if (!trimmed) continue;
+        if (!parseFullModelId(trimmed)) continue;
+        if (seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        result.push(trimmed);
+    }
+
+    return result;
 }
 
 async function mapWithConcurrency<T, U>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<U>): Promise<U[]> {
@@ -89,11 +174,6 @@ function extractUserCompactionNote(llmMessages: any[]): string | undefined {
 
     return undefined;
 }
-
-type DetectedFileOps = {
-    modifiedFiles: string[];
-    deletedFiles: string[];
-};
 
 function detectFileOpsFromConversation(llmMessages: any[]): DetectedFileOps {
     const toolCallsById = new Map<string, { name: string; args: any }>();
@@ -139,6 +219,536 @@ function detectFileOpsFromConversation(llmMessages: any[]): DetectedFileOps {
     return { modifiedFiles: modified, deletedFiles: deleted };
 }
 
+function stripThinkingLevelSuffix(pattern: string): string {
+    const colonIndex = pattern.lastIndexOf(":");
+    if (colonIndex === -1) return pattern;
+
+    const suffix = pattern.slice(colonIndex + 1).toLowerCase();
+    if (!THINKING_LEVEL_SUFFIXES.has(suffix)) return pattern;
+    return pattern.slice(0, colonIndex);
+}
+
+function escapeRegex(char: string): string {
+    return char.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
+}
+
+function globToRegExp(glob: string): RegExp {
+    let pattern = "^";
+
+    for (let i = 0; i < glob.length; i += 1) {
+        const char = glob[i]!;
+
+        if (char === "*") {
+            pattern += ".*";
+            continue;
+        }
+
+        if (char === "?") {
+            pattern += ".";
+            continue;
+        }
+
+        if (char === "[") {
+            const closingIndex = glob.indexOf("]", i + 1);
+            if (closingIndex !== -1) {
+                pattern += glob.slice(i, closingIndex + 1);
+                i = closingIndex;
+                continue;
+            }
+        }
+
+        pattern += escapeRegex(char);
+    }
+
+    pattern += "$";
+    return new RegExp(pattern, "i");
+}
+
+function matchesModelPattern(pattern: string, model: Pick<Model<any>, "provider" | "id">): boolean {
+    const normalizedPattern = stripThinkingLevelSuffix(pattern.trim());
+    if (!normalizedPattern) return false;
+
+    const fullId = fullModelId(model);
+    const hasGlob = normalizedPattern.includes("*") || normalizedPattern.includes("?") || normalizedPattern.includes("[");
+
+    if (!hasGlob) {
+        return normalizedPattern.toLowerCase() === fullId.toLowerCase() || normalizedPattern.toLowerCase() === model.id.toLowerCase();
+    }
+
+    const regex = globToRegExp(normalizedPattern);
+    return regex.test(fullId) || regex.test(model.id);
+}
+
+function getScopedModels(allModels: Model<any>[], enabledPatterns: string[] | undefined): Model<any>[] {
+    if (!enabledPatterns || enabledPatterns.length === 0) {
+        return [...allModels];
+    }
+
+    const scoped: Model<any>[] = [];
+    const seen = new Set<string>();
+
+    for (const pattern of enabledPatterns) {
+        for (const model of allModels) {
+            if (!matchesModelPattern(pattern, model)) continue;
+            const id = fullModelId(model);
+            if (seen.has(id)) continue;
+            seen.add(id);
+            scoped.push(model);
+        }
+    }
+
+    return scoped;
+}
+
+function sortModelsForPicker(models: Model<any>[]): Model<any>[] {
+    return [...models].sort((a, b) => {
+        const providerCompare = a.provider.localeCompare(b.provider);
+        if (providerCompare !== 0) return providerCompare;
+        return a.id.localeCompare(b.id);
+    });
+}
+
+function getSettingsPaths(cwd: string): { global: string; project: string } {
+    return {
+        global: path.join(getAgentDir(), "settings.json"),
+        project: path.join(cwd, PROJECT_CONFIG_DIR, "settings.json"),
+    };
+}
+
+function readJsonObjectFile(filePath: string): ReadJsonResult {
+    if (!fs.existsSync(filePath)) {
+        return { exists: false, data: {} };
+    }
+
+    try {
+        const content = fs.readFileSync(filePath, "utf-8");
+        if (!content.trim()) {
+            return { exists: true, data: {} };
+        }
+
+        const parsed = JSON.parse(content);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return {
+                exists: true,
+                data: {},
+                error: `Settings file must contain a top-level JSON object: ${filePath}`,
+            };
+        }
+
+        return { exists: true, data: parsed as JsonObject };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { exists: true, data: {}, error: `Failed to parse ${filePath}: ${message}` };
+    }
+}
+
+function extractPersistedCompactionConfig(data: JsonObject): PersistedCompactionConfig {
+    const raw = data[CONFIG_NAMESPACE];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        return {};
+    }
+
+    const object = raw as JsonObject;
+    const models = Array.isArray(object.models)
+        ? normalizeModelIds(object.models.filter((value): value is string => typeof value === "string"))
+        : undefined;
+
+    return { models };
+}
+
+function loadCompactionModelConfig(cwd: string): LoadedCompactionConfig {
+    const paths = getSettingsPaths(cwd);
+    const globalRead = readJsonObjectFile(paths.global);
+    const projectRead = readJsonObjectFile(paths.project);
+
+    const globalConfig = globalRead.error ? {} : extractPersistedCompactionConfig(globalRead.data);
+    const projectConfig = projectRead.error ? {} : extractPersistedCompactionConfig(projectRead.data);
+
+    if (projectConfig.models !== undefined) {
+        return {
+            models: projectConfig.models,
+            source: "project",
+            globalRead,
+            projectRead,
+            paths,
+        };
+    }
+
+    if (globalConfig.models !== undefined) {
+        return {
+            models: globalConfig.models,
+            source: "global",
+            globalRead,
+            projectRead,
+            paths,
+        };
+    }
+
+    return {
+        models: getDefaultCompactionModelIds(),
+        source: "default",
+        globalRead,
+        projectRead,
+        paths,
+    };
+}
+
+function chooseSaveScope(config: LoadedCompactionConfig): ConfigScope {
+    return config.projectRead.exists ? "project" : "global";
+}
+
+function writeJsonObjectFileAtomic(filePath: string, data: JsonObject): void {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+    fs.renameSync(tempPath, filePath);
+}
+
+function persistCompactionModelConfig(cwd: string, scope: ConfigScope, models: string[]): string {
+    const paths = getSettingsPaths(cwd);
+    const filePath = scope === "global" ? paths.global : paths.project;
+    const current = readJsonObjectFile(filePath);
+
+    if (current.error) {
+        throw new Error(current.error);
+    }
+
+    const root: JsonObject = { ...current.data };
+    const existingNamespace = root[CONFIG_NAMESPACE];
+    const nextNamespace: JsonObject =
+        existingNamespace && typeof existingNamespace === "object" && !Array.isArray(existingNamespace)
+            ? { ...(existingNamespace as JsonObject) }
+            : {};
+
+    nextNamespace.models = normalizeModelIds(models);
+    root[CONFIG_NAMESPACE] = nextNamespace;
+
+    writeJsonObjectFileAtomic(filePath, root);
+    return filePath;
+}
+
+function getConfigWarnings(config: LoadedCompactionConfig): string[] {
+    const warnings: string[] = [];
+    if (config.globalRead.error) warnings.push(config.globalRead.error);
+    if (config.projectRead.error) warnings.push(config.projectRead.error);
+    return warnings;
+}
+
+// ============================================================================
+// COMPACTION MODEL PICKER UI
+// ============================================================================
+
+function toggleSelectedModelIds(selectedIds: string[], id: string): string[] {
+    return selectedIds.includes(id) ? selectedIds.filter((value) => value !== id) : [...selectedIds, id];
+}
+
+function addSelectedModelIds(selectedIds: string[], idsToAdd: string[]): string[] {
+    const result = [...selectedIds];
+    for (const id of idsToAdd) {
+        if (!result.includes(id)) result.push(id);
+    }
+    return result;
+}
+
+function clearSelectedModelIds(selectedIds: string[], idsToClear?: string[]): string[] {
+    if (!idsToClear) return [];
+    const ids = new Set(idsToClear);
+    return selectedIds.filter((value) => !ids.has(value));
+}
+
+function moveSelectedModelId(selectedIds: string[], id: string, delta: number): string[] {
+    const index = selectedIds.indexOf(id);
+    if (index < 0) return selectedIds;
+
+    const nextIndex = index + delta;
+    if (nextIndex < 0 || nextIndex >= selectedIds.length) return selectedIds;
+
+    const result = [...selectedIds];
+    [result[index], result[nextIndex]] = [result[nextIndex]!, result[index]!];
+    return result;
+}
+
+function orderModelIds(selectedIds: string[], activeIds: string[]): string[] {
+    const activeSet = new Set(activeIds);
+    const orderedSelected = selectedIds.filter((id) => activeSet.has(id));
+    const remaining = activeIds.filter((id) => !orderedSelected.includes(id));
+    return [...orderedSelected, ...remaining];
+}
+
+class CompactionModelSelectorComponent extends Container implements Focusable {
+    private readonly modelsById = new Map<string, Model<any>>();
+    private readonly allIds: string[];
+    private readonly scopedIds: string[];
+    private readonly saveScope: ConfigScope;
+    private readonly done: (result: PickerResult | undefined) => void;
+    private readonly searchInput: Input;
+    private readonly scopeText: Text;
+    private readonly summaryText: Text;
+    private readonly listContainer: Container;
+    private readonly footerText: Text;
+
+    private selectedIds: string[];
+    private scope: PickerScope;
+    private filteredItems: PickerItem[] = [];
+    private selectedIndex = 0;
+    private maxVisible = 15;
+
+    private _focused = false;
+
+    constructor(
+        private readonly tui: TUI,
+        private readonly theme: any,
+        options: {
+            allModels: Model<any>[];
+            scopedModels: Model<any>[];
+            initialSelectedIds: string[];
+            initialScope: PickerScope;
+            saveScope: ConfigScope;
+            done: (result: PickerResult | undefined) => void;
+        },
+    ) {
+        super();
+
+        for (const model of options.allModels) {
+            this.modelsById.set(fullModelId(model), model);
+        }
+
+        this.allIds = options.allModels.map((model) => fullModelId(model));
+        this.scopedIds = options.scopedModels.map((model) => fullModelId(model));
+        this.selectedIds = normalizeModelIds(options.initialSelectedIds);
+        this.scope = options.initialScope;
+        this.saveScope = options.saveScope;
+        this.done = options.done;
+
+        this.addChild(new Spacer(1));
+        this.addChild(new DynamicBorder((text) => this.theme.fg("accent", text)));
+        this.addChild(new Spacer(1));
+        this.addChild(new Text(this.theme.fg("accent", this.theme.bold("Compaction Model Fallbacks")), 0, 0));
+        this.scopeText = new Text("", 0, 0);
+        this.addChild(this.scopeText);
+        this.addChild(new Spacer(1));
+
+        this.searchInput = new Input();
+        this.addChild(this.searchInput);
+        this.addChild(new Spacer(1));
+
+        this.listContainer = new Container();
+        this.addChild(this.listContainer);
+        this.addChild(new Spacer(1));
+
+        this.summaryText = new Text("", 0, 0);
+        this.addChild(this.summaryText);
+        this.footerText = new Text("", 0, 0);
+        this.addChild(this.footerText);
+        this.addChild(new Spacer(1));
+        this.addChild(new DynamicBorder((text) => this.theme.fg("accent", text)));
+        this.addChild(new Spacer(1));
+
+        this.refresh();
+    }
+
+    get focused(): boolean {
+        return this._focused;
+    }
+
+    set focused(value: boolean) {
+        this._focused = value;
+        this.searchInput.focused = value;
+    }
+
+    private getUnavailableSelectedIds(): string[] {
+        return this.selectedIds.filter((id) => !this.modelsById.has(id));
+    }
+
+    private getActiveIds(): string[] {
+        return this.scope === "all" ? this.allIds : this.scopedIds;
+    }
+
+    private getScopeText(): string {
+        const allText = this.scope === "all" ? this.theme.fg("accent", "all") : this.theme.fg("muted", "all");
+        const scopedText = this.scope === "scoped" ? this.theme.fg("accent", "scoped") : this.theme.fg("muted", "scoped");
+        const saveTarget = this.theme.fg("warning", this.saveScope);
+        return `${this.theme.fg("muted", "Source: ")}${allText}${this.theme.fg("muted", " | ")}${scopedText}${this.theme.fg("muted", " · Save to ")}${saveTarget}`;
+    }
+
+    private getSummaryText(): string {
+        const selectedCount = this.selectedIds.length;
+        const activeCount = this.getActiveIds().length;
+        const hiddenCount = this.getUnavailableSelectedIds().length;
+        const parts = [
+            `${selectedCount} selected`,
+            `${activeCount} visible in ${this.scope}`,
+        ];
+        if (hiddenCount > 0) {
+            parts.push(`${hiddenCount} unavailable hidden`);
+        }
+        return this.theme.fg("muted", parts.join(" · "));
+    }
+
+    private getFooterText(): string {
+        return this.theme.fg(
+            "dim",
+            "Enter toggle · ^A add all · ^X clear · Alt+↑↓ reorder · Tab scope · ^S save · Esc cancel",
+        );
+    }
+
+    private buildItems(): PickerItem[] {
+        return orderModelIds(this.selectedIds, this.getActiveIds())
+            .filter((id) => this.modelsById.has(id))
+            .map((id) => ({
+                fullId: id,
+                model: this.modelsById.get(id)!,
+                selected: this.selectedIds.includes(id),
+            }));
+    }
+
+    private refresh(): void {
+        const query = this.searchInput.getValue();
+        const items = this.buildItems();
+        this.filteredItems = query
+            ? fuzzyFilter(items, query, (item) => `${item.model.provider} ${item.model.id} ${item.model.name} ${item.fullId}`)
+            : items;
+
+        this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredItems.length - 1));
+        this.scopeText.setText(this.getScopeText());
+        this.summaryText.setText(this.getSummaryText());
+        this.footerText.setText(this.getFooterText());
+        this.updateList();
+        this.tui.requestRender();
+    }
+
+    private updateList(): void {
+        this.listContainer.clear();
+
+        if (this.filteredItems.length === 0) {
+            if (this.getActiveIds().length === 0 && this.scope === "scoped") {
+                this.listContainer.addChild(
+                    new Text(this.theme.fg("muted", "  No scoped models. Configure enabledModels in settings or switch to all."), 0, 0),
+                );
+            } else {
+                this.listContainer.addChild(new Text(this.theme.fg("muted", "  No matching models"), 0, 0));
+            }
+            return;
+        }
+
+        const startIndex = Math.max(
+            0,
+            Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
+        );
+        const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+
+        for (let i = startIndex; i < endIndex; i += 1) {
+            const item = this.filteredItems[i]!;
+            const isCursor = i === this.selectedIndex;
+            const prefix = isCursor ? this.theme.fg("accent", "→ ") : "  ";
+            const modelText = isCursor ? this.theme.fg("accent", item.model.id) : item.model.id;
+            const providerBadge = this.theme.fg("muted", ` [${item.model.provider}]`);
+            const selectionBadge = item.selected ? this.theme.fg("success", " ✓") : this.theme.fg("dim", " ○");
+            this.listContainer.addChild(new Text(`${prefix}${modelText}${providerBadge}${selectionBadge}`, 0, 0));
+        }
+
+        if (startIndex > 0 || endIndex < this.filteredItems.length) {
+            this.listContainer.addChild(
+                new Text(this.theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredItems.length})`), 0, 0),
+            );
+        }
+
+        const selected = this.filteredItems[this.selectedIndex];
+        if (selected) {
+            this.listContainer.addChild(new Spacer(1));
+            this.listContainer.addChild(new Text(this.theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
+            this.listContainer.addChild(new Text(this.theme.fg("muted", `  Full ID: ${selected.fullId}`), 0, 0));
+        }
+    }
+
+    handleInput(data: string): void {
+        const kb = getKeybindings();
+
+        if (kb.matches(data, "tui.input.tab")) {
+            this.scope = this.scope === "all" ? "scoped" : "all";
+            this.selectedIndex = 0;
+            this.refresh();
+            return;
+        }
+
+        if (kb.matches(data, "tui.select.up")) {
+            if (this.filteredItems.length === 0) return;
+            this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
+            this.updateList();
+            this.tui.requestRender();
+            return;
+        }
+
+        if (kb.matches(data, "tui.select.down")) {
+            if (this.filteredItems.length === 0) return;
+            this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+            this.updateList();
+            this.tui.requestRender();
+            return;
+        }
+
+        if (matchesKey(data, Key.alt("up")) || matchesKey(data, Key.alt("down"))) {
+            const item = this.filteredItems[this.selectedIndex];
+            if (item && this.selectedIds.includes(item.fullId)) {
+                const delta = matchesKey(data, Key.alt("up")) ? -1 : 1;
+                this.selectedIds = moveSelectedModelId(this.selectedIds, item.fullId, delta);
+                this.refresh();
+            }
+            return;
+        }
+
+        if (matchesKey(data, Key.enter)) {
+            const item = this.filteredItems[this.selectedIndex];
+            if (item) {
+                this.selectedIds = toggleSelectedModelIds(this.selectedIds, item.fullId);
+                this.refresh();
+            }
+            return;
+        }
+
+        if (matchesKey(data, Key.ctrl("a"))) {
+            const idsToAdd = this.searchInput.getValue()
+                ? this.filteredItems.map((item) => item.fullId)
+                : this.getActiveIds();
+            this.selectedIds = addSelectedModelIds(this.selectedIds, idsToAdd);
+            this.refresh();
+            return;
+        }
+
+        if (matchesKey(data, Key.ctrl("x"))) {
+            const idsToClear = this.searchInput.getValue()
+                ? this.filteredItems.map((item) => item.fullId)
+                : undefined;
+            this.selectedIds = clearSelectedModelIds(this.selectedIds, idsToClear);
+            this.refresh();
+            return;
+        }
+
+        if (matchesKey(data, Key.ctrl("s"))) {
+            this.done({ modelIds: this.selectedIds });
+            return;
+        }
+
+        if (matchesKey(data, Key.ctrl("c"))) {
+            if (this.searchInput.getValue()) {
+                this.searchInput.setValue("");
+                this.refresh();
+            } else {
+                this.done(undefined);
+            }
+            return;
+        }
+
+        if (matchesKey(data, Key.escape)) {
+            this.done(undefined);
+            return;
+        }
+
+        this.searchInput.handleInput(data);
+        this.refresh();
+    }
+}
+
 // ============================================================================
 // DEBUG INFRASTRUCTURE
 // ============================================================================
@@ -165,10 +775,148 @@ function saveCompactionDebug(sessionId: string, data: any): void {
 }
 
 // ============================================================================
+// MODEL RESOLUTION
+// ============================================================================
+
+async function resolveCompactionModel(ctx: ExtensionContext): Promise<
+    { model: Model<any>; requestAuth: RequestAuth; configuredIds: string[]; configSource: ConfigSource } | undefined
+> {
+    const config = loadCompactionModelConfig(ctx.cwd);
+    const configuredIds = config.models;
+
+    debugLog(`Compaction model config source: ${config.source}`);
+    debugLog(`Compaction model candidates: ${configuredIds.join(", ") || "(none)"}`);
+
+    for (const candidateId of configuredIds) {
+        const parsed = parseFullModelId(candidateId);
+        if (!parsed) {
+            debugLog(`Skipping invalid compaction model id: ${candidateId}`);
+            continue;
+        }
+
+        const registryModel = ctx.modelRegistry.find(parsed.provider, parsed.id);
+        if (!registryModel) {
+            debugLog(`Model ${candidateId} not registered in ctx.modelRegistry`);
+            continue;
+        }
+
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(registryModel);
+        if (!auth.ok) {
+            debugLog(`No request auth for ${candidateId}: ${auth.error}`);
+            continue;
+        }
+
+        return {
+            model: registryModel,
+            requestAuth: { apiKey: auth.apiKey, headers: auth.headers },
+            configuredIds,
+            configSource: config.source,
+        };
+    }
+
+    if (ctx.model) {
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+        if (auth.ok) {
+            debugLog(`Falling back to session model ${ctx.model.provider}/${ctx.model.id}`);
+            return {
+                model: ctx.model,
+                requestAuth: { apiKey: auth.apiKey, headers: auth.headers },
+                configuredIds,
+                configSource: config.source,
+            };
+        }
+
+        debugLog(`No request auth for session model ${ctx.model.provider}/${ctx.model.id}: ${auth.error}`);
+    }
+
+    return undefined;
+}
+
+// ============================================================================
 // EXTENSION
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
+    pi.registerCommand("compaction-model", {
+        description: "Select ordered fallback models for agentic compaction",
+        getArgumentCompletions: (prefix) => {
+            const options = ["global", "project"];
+            const filtered = options.filter((option) => option.startsWith(prefix.trim().toLowerCase()));
+            return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
+        },
+        handler: async (args, ctx) => {
+            if (!ctx.hasUI) {
+                ctx.ui.notify("/compaction-model requires the interactive TUI", "warning");
+                return;
+            }
+
+            const trimmedArgs = args.trim().toLowerCase();
+            let saveScopeOverride: ConfigScope | undefined;
+
+            if (trimmedArgs) {
+                if (trimmedArgs === "global" || trimmedArgs === "project") {
+                    saveScopeOverride = trimmedArgs;
+                } else {
+                    ctx.ui.notify("Usage: /compaction-model [global|project]", "warning");
+                    return;
+                }
+            }
+
+            if (!ctx.isIdle()) {
+                await ctx.waitForIdle();
+            }
+
+            const config = loadCompactionModelConfig(ctx.cwd);
+            for (const warning of getConfigWarnings(config)) {
+                ctx.ui.notify(warning, "warning");
+            }
+
+            const availableModels = sortModelsForPicker(ctx.modelRegistry.getAvailable());
+            if (availableModels.length === 0) {
+                ctx.ui.notify("No authenticated models are currently available", "warning");
+                return;
+            }
+
+            const settingsManager = SettingsManager.create(ctx.cwd, getAgentDir());
+            const enabledModelPatterns = settingsManager.getEnabledModels();
+            const settingsErrors = settingsManager.drainErrors();
+            for (const error of settingsErrors) {
+                ctx.ui.notify(`Could not read ${error.scope} settings: ${error.error.message}`, "warning");
+            }
+
+            const scopedModels = sortModelsForPicker(getScopedModels(availableModels, enabledModelPatterns));
+            const saveScope = saveScopeOverride ?? chooseSaveScope(config);
+            const initialScope: PickerScope = enabledModelPatterns && enabledModelPatterns.length > 0 && scopedModels.length > 0 ? "scoped" : "all";
+
+            const result = await ctx.ui.custom<PickerResult | undefined>((tui, theme, _keybindings, done) => {
+                return new CompactionModelSelectorComponent(tui, theme, {
+                    allModels: availableModels,
+                    scopedModels,
+                    initialSelectedIds: config.models,
+                    initialScope,
+                    saveScope,
+                    done,
+                });
+            });
+
+            if (!result) {
+                return;
+            }
+
+            try {
+                const savedPath = persistCompactionModelConfig(ctx.cwd, saveScope, result.modelIds);
+                const savedCount = normalizeModelIds(result.modelIds).length;
+                ctx.ui.notify(
+                    `Saved ${savedCount} compaction model${savedCount === 1 ? "" : "s"} to ${savedPath}`,
+                    "info",
+                );
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                ctx.ui.notify(`Failed to save compaction models: ${message}`, "error");
+            }
+        },
+    });
+
     pi.on("session_before_compact", async (event, ctx) => {
         const { preparation, signal, branchEntries } = event;
         const { tokensBefore, firstKeptEntryId, previousSummary } = preparation;
@@ -182,40 +930,13 @@ export default function (pi: ExtensionAPI) {
             return;
         }
 
-        // Try each model in order until one works (use registry for extension-registered providers)
-        let model: Model<any> | null = null;
-        let apiKey: string | undefined;
-
-        for (const cfg of COMPACTION_MODELS) {
-            const registryModel = ctx.modelRegistry.getAll().find((m) => m.provider === cfg.provider && m.id === cfg.id);
-
-            if (!registryModel) {
-                debugLog(`Model ${cfg.provider}/${cfg.id} not registered in ctx.modelRegistry`);
-                continue;
-            }
-
-            const key = await ctx.modelRegistry.getApiKey(registryModel);
-            if (!key) {
-                debugLog(`No API key for ${cfg.provider}/${cfg.id}`);
-                continue;
-            }
-
-            model = registryModel;
-            apiKey = key;
-            break;
-        }
-
-        // Fall back to session model
-        if (!model) {
-            model = ctx.model;
-            apiKey = await ctx.modelRegistry.getApiKey(model);
-        }
-
-        if (!model || !apiKey) {
+        const selectedModel = await resolveCompactionModel(ctx);
+        if (!selectedModel) {
             ctx.ui.notify("No model available for compaction", "warning");
             return;
         }
 
+        const { model, requestAuth } = selectedModel;
         const llmMessages = convertToLlm(allMessages);
         const bashFiles = { "/conversation.json": JSON.stringify(llmMessages, null, 2) };
 
@@ -295,7 +1016,7 @@ ${deterministicFileOpsContext}${userCompactionNoteContext}
 
 ## Rules for Accuracy
 
-1. **Session Type Detection**: 
+1. **Session Type Detection**:
    - If you only see "read" tool calls → this is a CODE REVIEW/EXPLORATION session, NOT implementation
    - Only claim files were "modified" if you can identify a successful modification tool result for a tool call.
    - Do NOT count failed/no-op operations (toolResult.isError==true) as modifications
@@ -365,7 +1086,11 @@ What remains to be done`;
             while (true) {
                 if (signal.aborted) return;
 
-                const response = await complete(model, { systemPrompt, messages, tools }, { apiKey, signal });
+                const response = await complete(model, { systemPrompt, messages, tools }, {
+                    apiKey: requestAuth.apiKey,
+                    headers: requestAuth.headers,
+                    signal,
+                });
 
                 const toolCalls = response.content.filter((c): c is any => c.type === "toolCall");
 
@@ -390,7 +1115,7 @@ What remains to be done`;
 
                         ctx.ui.notify(
                             `${tc.name}: ${command.slice(0, TOOL_CALL_PREVIEW_CHARS)}${command.length > TOOL_CALL_PREVIEW_CHARS ? "..." : ""}`,
-                            "info"
+                            "info",
                         );
 
                         let result: string;
@@ -416,8 +1141,8 @@ What remains to be done`;
                     });
 
                     for (let i = 0; i < toolCalls.length; i += 1) {
-                        const tc = toolCalls[i];
-                        const r = results[i];
+                        const tc = toolCalls[i]!;
+                        const r = results[i]!;
 
                         const toolResultMsg: ToolResultMessage = {
                             role: "toolResult",
