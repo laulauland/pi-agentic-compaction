@@ -39,16 +39,28 @@ The extension also adds some deterministic guardrails:
 
 ## Model selection
 
+The agentic compaction loop is a good fit for small, fast models. The task is structured: navigate a JSON file, run a few shell commands, and emit a summary in a defined format. That plays to the strengths of instruction-following models like `gpt-5.4-mini` — models that are reliable on well-specified tasks, respond quickly, and are cheap enough that multiple tool-call steps do not become a bottleneck.
+
 By default it tries these models, in order:
 
 ```ts
 const COMPACTION_MODELS = [
   { provider: "cerebras", id: "zai-glm-4.7" },
-  { provider: "anthropic", id: "claude-haiku-4-5" },
+  { provider: "openai", id: "gpt-5.4-mini" },
 ];
 ```
 
 If none are available, it falls back to the current session model.
+
+### Steerable compaction
+
+Because the summarizer runs as a separate model in its own agentic loop, its behavior is directly steerable. You can pass guidance via `/compact` notes:
+
+```text
+/compact focus on the authentication changes and unresolved bugs
+```
+
+The note is forwarded into the summarizer's system prompt, biasing both its exploration strategy and its output. Small, instruction-following models tend to respect this kind of explicit steering reliably, which makes the behavior predictable without requiring prompt engineering on the user's part.
 
 ## Installation
 
@@ -104,7 +116,7 @@ Useful constants include:
 ```ts
 const COMPACTION_MODELS = [
   { provider: "cerebras", id: "zai-glm-4.7" },
-  { provider: "anthropic", id: "claude-haiku-4-5" },
+  { provider: "openai", id: "gpt-5.4-mini" },
 ];
 
 const DEBUG_COMPACTIONS = false;
@@ -123,19 +135,32 @@ A few relevant details if you plan to use or modify this package:
 
 ## Trade-offs
 
-This approach is often better for long sessions, but it is not strictly superior in every case.
+The agentic approach has different characteristics from a single-pass summarization, and those trade-offs interact with model size in specific ways.
 
 Pros:
 
-- cheaper for long conversations
-- more targeted inspection of the transcript
+- cheaper per compaction for long conversations, since the model reads only what it queries
+- more targeted inspection of the transcript rather than ingesting everything at once
 - better file-change awareness than a pure freeform summary
+- steerable: `/compact` notes let you direct what the summarizer pays attention to
+- the structured, tool-use format suits small instruction-following models well
 
 Cons:
 
-- may miss details a full-pass summarizer would catch
+- may miss details a full-pass summarizer would catch, since exploration is model-driven
 - requires multiple model/tool steps instead of one call
-- behavior depends partly on the exploration strategy in the prompt
+- a smaller model is less likely to self-correct if its exploration strategy is suboptimal
+- for sessions with subtle cross-cutting context, a larger model may produce more coherent summaries
+
+### Accuracy considerations
+
+The trade-offs above are worth thinking through when choosing a compaction model.
+
+The agentic loop structure partially compensates for the limitations of smaller models: the model can re-query sections of the transcript it is uncertain about rather than relying on a single pass over everything. And because the format is well-specified — run some shell commands, write a summary — the task plays to the strengths of models that follow instructions precisely.
+
+That said, small models can struggle when sessions involve nuanced reasoning, implicit dependencies, or ambiguous cause-and-effect chains. If the exploration strategy in the prompt does not surface the right parts of the transcript, a smaller model is less likely to recover from that.
+
+If summary quality on complex sessions matters more than speed or cost, consider updating `COMPACTION_MODELS` in `index.ts` to use a larger model. The rest of the extension is model-agnostic.
 
 ## Package contents
 
