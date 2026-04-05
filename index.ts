@@ -486,6 +486,8 @@ class CompactionModelSelectorComponent extends Container implements Focusable {
     private readonly summaryText: Text;
     private readonly listContainer: Container;
     private readonly footerText: Text;
+    private readonly tui: TUI;
+    private readonly theme: any;
 
     private selectedIds: string[];
     private scope: PickerScope;
@@ -496,8 +498,8 @@ class CompactionModelSelectorComponent extends Container implements Focusable {
     private _focused = false;
 
     constructor(
-        private readonly tui: TUI,
-        private readonly theme: any,
+        tui: TUI,
+        theme: any,
         options: {
             allModels: Model<any>[];
             scopedModels: Model<any>[];
@@ -508,6 +510,8 @@ class CompactionModelSelectorComponent extends Container implements Focusable {
         },
     ) {
         super();
+        this.tui = tui;
+        this.theme = theme;
 
         for (const model of options.allModels) {
             this.modelsById.set(fullModelId(model), model);
